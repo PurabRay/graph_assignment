@@ -289,17 +289,19 @@
 #         save_friends(u, list(fr))
 #     for u, reqs in g.pending_requests.items():
 #         save_requests(u, list(reqs))
+# user_graph_db.py
+
 import streamlit as st
 from pymongo import MongoClient
 from typing import List, Set, Dict, Optional
 
 # --- MongoDB Setup via Streamlit Secrets ---
-MONGO_URI = st.secrets["mongo_uri"]
-client    = MongoClient(MONGO_URI)
-db        = client["social_app"]
-profiles_col     = db["profiles"]       # { username, bio, tastes:list[str], password, avatar: bytes }
-friends_col      = db["friendships"]    # { username, friends:list[str] }
-requests_col     = db["friend_requests"]# { username, requests:list[str] }
+MONGO_URI    = st.secrets["mongo_uri"]
+client       = MongoClient(MONGO_URI)
+db           = client["social_app"]
+profiles_col = db["profiles"]        # { username, bio, tastes:list[str], password, avatar: bytes }
+friends_col  = db["friendships"]     # { username, friends:list[str] }
+requests_col = db["friend_requests"] # { username, requests:list[str] }
 
 # --- DSU for Taste Clusters ---
 class DSU:
@@ -322,7 +324,7 @@ class DSU:
         roots = {self.find(t) for t in taste_list}
         return {t for t in self.parent if self.find(t) in roots}
 
-# --- In-memory Graph Logic ---
+# --- In-memory Graph + Persistence Logic ---
 class Graph:
     def __init__(self):
         self.adj: Dict[str, Set[str]]      = {}
@@ -336,28 +338,30 @@ class Graph:
         ]
         self.taste_dsu = DSU()
 
-    # --- Taste DSU Rebuild ---
+    # rebuild DSU whenever profiles change
     def _rebuild_taste_dsu(self):
         self.taste_dsu = DSU()
         for t in self.taste_list:
             self.taste_dsu.find(t)
         for p in self.profile.values():
             ts = p.get("tastes", [])
-            if len(ts) > 1:
-                for i in range(1, len(ts)):
-                    self.taste_dsu.union(ts[0], ts[i])
+            for i in range(1, len(ts)):
+                self.taste_dsu.union(ts[0], ts[i])
 
     def users_in_same_taste_cluster(self, user: str) -> Set[str]:
-        if user not in self.profile: return set()
+        if user not in self.profile:
+            return set()
         ut = self.profile[user].get("tastes", [])
-        if not ut: return set()
+        if not ut:
+            return set()
         ct = self.taste_dsu.cluster_members(ut)
         return {
-            o for o,p in self.profile.items()
-            if o != user and set(p.get("tastes", [])) & ct
+            other
+            for other, pdata in self.profile.items()
+            if other != user and set(pdata.get("tastes", [])) & ct
         }
 
-    # --- CRUD & Profile w/ Avatar ---
+    # --- CRUD & Avatars ---
     def add_user(self,
                  user: str,
                  bio: str,
@@ -437,7 +441,7 @@ class Graph:
     def reject_friend_request(self, sender: str, receiver: str):
         self.pending_requests.get(receiver, set()).discard(sender)
 
-    # --- BFS Shortest Path (no KeyError) ---
+    # --- Shortest Path (safe) ---
     def bfs_shortest_path(self, src: str, dst: str) -> Optional[List[str]]:
         if src not in self.adj or dst not in self.adj:
             return None
@@ -453,7 +457,7 @@ class Graph:
                     parent[nei] = n
                     if nei == dst:
                         path, cur = [], dst
-                        while cur:
+                        while cur is not None:
                             path.append(cur)
                             cur = parent[cur]
                         return path[::-1]
@@ -463,34 +467,31 @@ class Graph:
     def mutual_friends(self, u: str, v: str) -> Set[str]:
         return self.adj.get(u, set()) & self.adj.get(v, set())
 
-    # --- Recommendations ---
+    # --- Recommendations (safe lookups) ---
     def recommend_friends(self, u: str) -> List[tuple]:
         if u not in self.adj:
             return []
         direct = self.adj[u]
-        ut = set(self.profile[u].get("tastes", []))
+        ut     = set(self.profile.get(u, {}).get("tastes", []))
 
-        # friends-of-friends
+        # FoF
         fof = set()
         for f in direct:
             fof |= self.adj.get(f, set())
         fof.discard(u)
         fof -= direct
 
-        # same taste cluster
         cu = self.users_in_same_taste_cluster(u)
-
-        # shared-taste counts
         sc = {}
         for other in cu | fof:
             if other == u:
                 continue
-            ot = set(self.profile[other].get("tastes", []))
+            ot = set(self.profile.get(other, {}).get("tastes", []))
             sc[other] = len(ut & ot)
 
-        both         = sorted(cu & fof,         key=lambda x: (-sc[x], x))
+        both         = sorted(cu & fof,          key=lambda x: (-sc[x], x))
         cluster_only = sorted(cu - set(both) - direct, key=lambda x: (-sc[x], x))
-        fof_only     = sorted(fof - set(both),  key=lambda x: (-sc[x], x))
+        fof_only     = sorted(fof - set(both),    key=lambda x: (-sc[x], x))
 
         return (
             [(n, 2, sc[n]) for n in both] +
@@ -503,17 +504,17 @@ class Graph:
 
     def connected_components(self) -> List[Set[str]]:
         visited, comps = set(), []
-        def dfs(node, comp):
-            visited.add(node)
-            comp.add(node)
-            for nei in self.adj.get(node, set()):
+        def dfs(nd, comp):
+            visited.add(nd)
+            comp.add(nd)
+            for nei in self.adj.get(nd, set()):
                 if nei not in visited:
                     dfs(nei, comp)
 
-        for node in self.adj:
-            if node not in visited:
+        for nd in self.adj:
+            if nd not in visited:
                 comp = set()
-                dfs(node, comp)
+                dfs(nd, comp)
                 comps.append(comp)
         return comps
 
@@ -528,7 +529,7 @@ class Graph:
 # --- DB ↔ Graph Persistence ---
 def load_graph_from_db() -> Graph:
     g = Graph()
-    # load profiles (incl. avatar)
+    # load profiles
     for doc in profiles_col.find():
         g.add_user(
             doc["username"],
